@@ -1,0 +1,269 @@
+import torch
+import json
+from FlagEmbedding import FlagModel
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+import json
+import torch.optim as optim
+from tqdm import tqdm  # 引入 tqdm 用于显示进度条
+
+# 配置设备
+device = torch.device('cpu')  # 强制使用 CPU
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+flag_model = FlagModel('C:\\Users\\Administrator\\Desktop\\Codes\\Auto-prompt-model\\plm\\bge-large-en-v1.5', use_fp16=True)
+model_path = 'C:\\Users\\Administrator\\Desktop\\Codes\\Auto-prompt-model\\model_fusion\\best_model.pth'    
+
+# 1. 处理数据集类
+# 1. 数据集定义（直接使用原始文本和SQL）
+class TextSQLDataset(Dataset):
+    def __init__(self, data, flag_model,loaded_model):  # 修正为 __init__
+        # 在初始化时预计算所有嵌入，并显示进度
+        self.flag_model = flag_model
+        self.loaded_model = loaded_model                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+        self.text_embeds = []
+        self.sql_embeds = []
+        self.fusion_embeds = []
+        
+        print("Processing dataset...")
+        for item in tqdm(data, desc="Encoding texts and SQLs"):
+            text = item['question']
+            sql = item['query']
+            
+            # 使用 FlagModel 获取嵌入
+            text_embed = torch.tensor(self.flag_model.encode(text), dtype=torch.float32)  # [1024]
+            sql_embed = torch.tensor(self.flag_model.encode(sql), dtype=torch.float32)   # [1024]
+            # 推理
+            with torch.no_grad():
+                fusion_embed, text_out, sql_out, sql_pred, text_pred = loaded_model(text_embed, sql_embed)
+            # 存储原始文本、SQL 和对应的嵌入
+            self.text_embeds.append(text_embed)
+            self.sql_embeds.append(sql_embed)
+            self.fusion_embeds.append(fusion_embed)
+    
+    def __len__(self):  # 修正为 __len__
+        return len(self.text_embeds)  # 返回嵌入的数量
+    
+    def __getitem__(self, idx):  # 修正为 __getitem__
+        # 直接返回预计算的嵌入
+        return {
+            'text_embed': self.text_embeds[idx],
+            'fusion_embed': self.fusion_embeds[idx]
+        }
+
+# TransformerFusion 模型
+class TransformerFusion(nn.Module):
+    def __init__(self, dim, num_layers=2, heads=4):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=heads)
+        self.alpha = nn.Parameter(torch.tensor(0.7, requires_grad=True))
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.sql_ffn = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim, dim)
+        )
+        # 非线性投影头
+        self.proj_sql = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),         # 添加非线性激活
+            nn.Dropout(0.1),   # 可选：防止过拟合
+            nn.Linear(dim, dim)
+        )
+        self.proj_text = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),         # 添加非线性激活
+            nn.Dropout(0.1),
+            nn.Linear(dim, dim)
+        )
+    def forward(self, v_text, v_sql):
+        combined = torch.cat([v_text.unsqueeze(0), v_sql.unsqueeze(0)], dim=0)  # [2, batch, dim]
+        output = self.encoder(combined)  # [2, batch, dim]
+        enhanced_sql = self.sql_ffn(output[1])  # [batch, dim]
+        fusion_embeds = self.alpha * enhanced_sql + (1 - self.alpha) * output[0]  # [batch, dim]
+        sql_pred = self.proj_sql(fusion_embeds)
+        text_pred = self.proj_text(fusion_embeds)
+        return fusion_embeds, v_text, v_sql,sql_pred, text_pred
+
+class TransformerProjection(nn.Module):
+    def __init__(self, input_dim, output_dim, num_layers=2, heads=4, hidden_dim=None):
+        super().__init__()
+        # 如果未指定hidden_dim，则与input_dim一致
+        if hidden_dim is None:
+            hidden_dim = input_dim
+        
+        # Transformer编码器层
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=heads)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 可学习的混合权重
+        self.alpha = nn.Parameter(torch.tensor(0.7, requires_grad=True))
+        
+        # 输入线性层：将输入维度映射到Transformer的内部维度
+        self.input_linear = nn.Linear(input_dim, hidden_dim)
+        
+        # 增强特征的FFN（模仿sql_ffn）
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # 非线性投影头：将增强后的特征映射到融合向量空间
+        self.proj_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, output_dim)  # 输出维度与融合向量一致
+        )
+    
+    def forward(self, v_text):
+        # v_text shape: [batch, input_dim]
+        
+        # 映射到Transformer的内部维度
+        x = self.input_linear(v_text)  # [batch, hidden_dim]
+        x = x.unsqueeze(0)  # [1, batch, hidden_dim]，增加序列维度
+        
+        # 通过Transformer编码器
+        encoded = self.encoder(x)  # [1, batch, hidden_dim]
+        encoded = encoded.squeeze(0)  # [batch, hidden_dim]
+        
+        # 通过FFN增强特征
+        enhanced = self.ffn(encoded)  # [batch, hidden_dim]
+        
+        # 混合原始Transformer输出和增强特征
+        mixed = self.alpha * enhanced + (1 - self.alpha) * encoded  # [batch, hidden_dim]
+        
+        # 通过投影头生成最终的投影向量
+        projected = self.proj_head(mixed)  # [batch, output_dim]
+        
+        return projected
+
+# 训练模型
+def train_projection_model(model, train_loader, val_loader, num_epochs=15, lr=5e-5, device='cuda', save_path='best_model.pth'):
+    """
+    训练TransformerProjection模型的函数。
+    
+    Args:
+        model: TransformerProjection模型实例
+        train_loader: 训练数据加载器，提供text_embed和fusion_embed
+        val_loader: 验证数据加载器，提供text_embed和fusion_embed
+        num_epochs: 训练轮数，默认为15
+        lr: 初始学习率，默认为5e-5
+        device: 训练设备，默认为'cuda'
+        save_path: 最佳模型保存路径，默认为'best_projection_model.pth'
+    """
+    # 优化器和学习率调度器
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)  # 每3个epoch降低10倍学习率
+    
+    # 损失函数：余弦嵌入损失
+    criterion = nn.CosineEmbeddingLoss()
+    
+    # 将模型移到指定设备
+    model.to(device)
+    
+    # 早停和最佳模型保存
+    best_val_loss = float('inf')
+    patience = 3
+    early_stop_counter = 0
+    
+    # 训练循环
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0
+        for batch in train_loader:
+            text_embeds = batch['text_embed'].to(device)  # [batch_size, input_dim]
+            fusion_embeds = batch['fusion_embed'].to(device)  # [batch_size, output_dim]
+            
+            optimizer.zero_grad()
+            projected = model(text_embeds)  # [batch_size, output_dim]
+            
+            # 计算损失：目标为1，表示投影向量应与融合向量相似
+            target = torch.ones(text_embeds.size(0)).to(device)
+            loss = criterion(projected, fusion_embeds, target)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # 验证循环
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                text_embeds = batch['text_embed'].to(device)
+                fusion_embeds = batch['fusion_embed'].to(device)
+                
+                projected = model(text_embeds)
+                target = torch.ones(text_embeds.size(0)).to(device)
+                loss = criterion(projected, fusion_embeds, target)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        
+        # 打印训练信息
+        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # 保存最佳模型并检查早停
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), save_path)
+            print(f"Saved best model with Val Loss: {best_val_loss:.4f} at {save_path}")
+            early_stop_counter = 0
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= patience:
+                print("Early stopping triggered")
+                break
+        
+        scheduler.step()  # 更新学习率
+    
+    torch.save(model.state_dict(), save_path)
+    print(f"Saved final model at {save_path}")
+
+# 加载模型的函数
+def load_trained_model(model_path, dim=1024, num_layers=2, heads=4, device='cuda'):
+    # 创建模型实例
+    model = TransformerFusion(dim=dim, num_layers=num_layers, heads=heads)
+    
+    # 加载保存的参数
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    
+    # 移动到指定设备
+    model.to(device)
+    
+    # 设置为评估模式
+    model.eval()
+    
+    return model
+
+
+# 5. 主程序
+if __name__ == "__main__":
+    # 加载模型
+    loaded_model = load_trained_model(model_path, dim=1024, num_layers=2, heads=4, device=device)
+    train_file_name = 'datasets/train.json'
+    test_file_name = 'datasets/val.json'
+    # 打开并读取 JSON 文件
+    with open(train_file_name, "r", encoding="utf-8") as file:
+        train_data = json.load(file)  
+    with open(test_file_name, "r", encoding="utf-8") as file:
+        val_data = json.load(file)  
+
+    # 数据加载
+    train_dataset = TextSQLDataset(train_data, flag_model,loaded_model)
+    val_dataset = TextSQLDataset(val_data, flag_model,loaded_model)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8)
+    # 初始化模型
+    proj_model = TransformerProjection(input_dim=1024, output_dim=1024, num_layers=2, heads=4)
+    # 指定保存路径
+    save_path = 'C:\\Users\\Administrator\\Desktop\\Codes\\Auto-prompt-model\\model_projection\\best_model.pth'
+    # 训练模型
+    train_projection_model(proj_model, train_loader, val_loader, num_epochs=15, lr=5e-5, device='cuda',save_path = save_path)
